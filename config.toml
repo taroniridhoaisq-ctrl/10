@@ -1,0 +1,4 @@
+[server]
+# Batas upload lewat tombol upload di browser (MB). Default 200.
+# Untuk file jauh lebih besar pakai upload_client.py (resumable) — tidak kena batas ini.
+maxUploadSize = 1024
