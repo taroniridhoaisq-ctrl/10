@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 import services as svc
 
+MAX_CHUNK = 256 * 1024 * 1024               # batas satu potongan (klien memakai 4-16 MB)
 PART_DIR = svc.BASE / "partial"          # di luar tmp/ agar tidak ikut terhapus "Bersihkan folder tmp"
 PART_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -226,7 +227,13 @@ class UploadServer:
                 if a is None:
                     return
                 q, name = a
-                length = int(self.headers.get("Content-Length", "0"))
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    length = -1
+                if not 0 <= length <= MAX_CHUNK:        # tolak potongan raksasa / header rusak
+                    self.close_connection = True
+                    return self._send(413, {"error": f"ukuran potongan harus 0..{MAX_CHUNK // 1024 // 1024} MB"})
                 try:
                     offset = int((q.get("offset") or ["0"])[0])
                 except ValueError:

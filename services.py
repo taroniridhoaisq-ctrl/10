@@ -23,6 +23,11 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
+try:                      # dipakai untuk gain PCM agar volume bisa diubah saat live
+    import numpy as np
+except Exception:  # noqa: BLE001
+    np = None
+
 BASE = Path("data").resolve()
 DIRS = {
     "video": BASE / "videos",
@@ -647,26 +652,18 @@ def _ytdlp(job: dict, url: str, stage: Path, hint: str, height: int, noplaylist:
         if cookie_file is not None:
             opts["cookiefile"] = str(cookie_file)
 
-    def attempt(embed: bool, thumb: bool, client: str | None = None) -> None:
-        """Sama seperti notebook Colab: audio saja; cover/thumbnail opsional dan boleh gagal."""
+    def attempt(extra_audio: bool) -> None:
         o = dict(opts)
-        o["js_runtimes"] = {"deno": {}}                 # penyelesai tantangan JS YouTube (wajib agar tidak 403)
-        o["remote_components"] = ["ejs:github"]
-        if client:
-            o["extractor_args"] = {"youtube": {"player_client": [client]}}
         if hint == "audio":
-            codec = ao["codec"]
-            o["format"] = "ba[ext=m4a]/ba/b" if codec == "m4a" else "ba/b"   # hanya stream audio
-            pps = [{"key": "FFmpegExtractAudio", "preferredcodec": codec,
+            o["format"] = "bestaudio/best"
+            pps = [{"key": "FFmpegExtractAudio", "preferredcodec": ao["codec"],
                     "preferredquality": str(ao["bitrate"])}]
-            if embed or thumb:
+            if extra_audio and (ao["embed"] or ao["thumb"]):
                 o["writethumbnail"] = True
-            if embed:
-                pps += [{"key": "FFmpegMetadata", "add_metadata": True},
-                        {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
-                        {"key": "EmbedThumbnail", "already_have_thumbnail": bool(thumb)}]
-            elif thumb:
-                pps += [{"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"}]
+                pps.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
+                if ao["embed"]:
+                    pps.append({"key": "FFmpegMetadata", "add_metadata": True})
+                    pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": bool(ao["thumb"])})
             o["postprocessors"] = pps
         else:
             h = height
@@ -676,59 +673,21 @@ def _ytdlp(job: dict, url: str, stage: Path, hint: str, height: int, noplaylist:
         with yt_dlp.YoutubeDL(o) as ydl:
             ydl.extract_info(url, download=True)
 
-    def clean_stage():
-        for f in stage.glob("*"):
-            if f != cookie_file:
-                f.unlink(missing_ok=True)
-
-    def run_attempts(client: str | None) -> None:
-        """Lengkap -> tanpa embed -> tanpa thumbnail. Hanya diulang jika gagal di tahap thumbnail/pemrosesan."""
-        plan = [(bool(ao["embed"]), bool(ao["thumb"])), (False, bool(ao["thumb"])), (False, False)]
-        tried, last = [], None
-        for embed, thumb in plan:
-            if hint != "audio" and tried:
-                break
-            if (embed, thumb) in tried:
-                continue
-            tried.append((embed, thumb))
-            try:
-                if len(tried) > 1:
-                    job["detail"] = "Cover/thumbnail gagal, mengulang dengan opsi lebih sederhana..."
-                    clean_stage()
-                attempt(embed, thumb, client)
-                return
-            except Exception as e:  # noqa: BLE001
-                last = e
-                low = str(e).lower()
-                if "postprocessing" not in low and "thumbnail" not in low:
-                    raise
-        raise last
-
     try:
-        last = None
-        # 403 Forbidden biasanya khusus satu "client" YouTube; coba beberapa jalur berurutan.
-        for n, client in enumerate((None, "tv", "mweb", "web_safari", "android_vr")):
-            try:
-                if n:
-                    job["detail"] = f"Diblokir (403), mencoba jalur lain {n}/4..."
-                    clean_stage()
-                run_attempts(client)
-                return True, ""
-            except Exception as e:  # noqa: BLE001
-                last = e
-                low = str(e).lower()
-                if "not a bot" in low or "confirm you" in low:
-                    break                      # diblokir per-IP: ganti jalur tidak membantu, hanya cookies
-                if "403" not in low and "forbidden" not in low:
-                    break
-        raise last
+        try:
+            attempt(extra_audio=True)
+        except Exception:  # noqa: BLE001
+            if hint != "audio":
+                raise
+            for f in stage.glob("*"):          # buang sisa percobaan gagal, ulang lebih sederhana
+                if f != cookie_file:
+                    f.unlink(missing_ok=True)
+            job["detail"] = "Cover/thumbnail gagal, mengulang tanpa itu..."
+            attempt(extra_audio=False)
+        return True, ""
     except Exception as e:  # noqa: BLE001
         clean = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
-        low = clean.lower()
-        hint403 = (" | YouTube memblokir IP server ini (dianggap bot). Tempel cookies YouTube di tab Impor "
-                   "(sama seperti kolom Cookies JSON di notebook), atau unduh audio di komputermu lalu upload."
-                   ) if ("403" in low or "forbidden" in low or "not a bot" in low) else ""
-        return False, "yt-dlp: " + clean[:300] + hint403
+        return False, "yt-dlp: " + clean[:350]
     finally:
         if cookie_file is not None:
             cookie_file.unlink(missing_ok=True)
@@ -894,10 +853,7 @@ def media_info(path) -> dict:
         x = real_video[0]
         v = {"codec": x.get("codec_name"), "w": int(x.get("width") or 0), "h": int(x.get("height") or 0),
              "fps": fps_of(x), "pix": x.get("pix_fmt"), "profile": x.get("profile"),
-             "bitrate": int(x.get("bit_rate") or 0),
-             "bframes": int(x.get("has_b_frames") or 0),
-             "vfr": (x.get("r_frame_rate") or "") != (x.get("avg_frame_rate") or ""),
-             "nb_frames": int(x.get("nb_frames") or 0) if str(x.get("nb_frames") or "").isdigit() else 0}
+             "bitrate": int(x.get("bit_rate") or 0)}
     if audio:
         x = audio[0]
         a = {"codec": x.get("codec_name"), "sr": int(x.get("sample_rate") or 0),
@@ -924,7 +880,7 @@ def keyframe_gap(path, dur: float, window: int = 120) -> float | None:
              "-show_entries", "frame=best_effort_timestamp_time", "-of", "csv=p=0",
              "-read_intervals", f"%+{window}", str(path)],
             capture_output=True, text=True, timeout=90).stdout
-        ts = sorted(float(x) for x in out.split() if re.fullmatch(r"-?\d+(\.\d+)?", x))
+        ts = sorted(float(x) for x in re.split(r"[,\s]+", out) if re.fullmatch(r"-?\d+(\.\d+)?", x))
     except Exception:  # noqa: BLE001
         return None
     if not ts:
@@ -934,7 +890,18 @@ def keyframe_gap(path, dur: float, window: int = 120) -> float | None:
     return max(b - a for a, b in zip(pts, pts[1:])) if len(pts) > 1 else None
 
 
-def video_copy_ok(paths, infos, relaxed: bool = False) -> tuple[bool, str]:
+def auto_vbr(h: int, fps: int) -> int:
+    """Tangga bitrate otomatis (kbps) sesuai rekomendasi YouTube Live: stabil, cukup tajam, ringan di upload."""
+    base = 1500 if h <= 480 else 3000 if h <= 720 else 5000 if h <= 1080 else 8000
+    return int(base * 1.4) if fps > 30 else base
+
+
+def br_cap(h: int) -> int:
+    """Batas bitrate sumber (bps) agar boleh dikirim copy tanpa re-encode; lebih tinggi = rawan putus."""
+    return 3_500_000 if h <= 480 else 6_000_000 if h <= 720 else 9_000_000 if h <= 1080 else 13_000_000
+
+
+def video_copy_ok(paths, infos) -> tuple[bool, str]:
     """Apakah semua video bisa disambung & dikirim apa adanya (tanpa re-encode)?"""
     if not infos or any(not i["ok"] or not i["v"] for i in infos):
         return False, "ada file tanpa video"
@@ -943,19 +910,13 @@ def video_copy_ok(paths, infos, relaxed: bool = False) -> tuple[bool, str]:
         v = i["v"]
         if v["codec"] != "h264" or v["pix"] != "yuv420p":
             return False, f"{Path(p).name}: bukan H.264 yuv420p"
-        if v.get("bframes", 0) > 0:
-            return False, f"{Path(p).name}: memakai B-frame (disambung mulus hanya setelah diseragamkan)"
-        if v.get("vfr"):
-            return False, f"{Path(p).name}: frame rate tidak konstan (VFR)"
         if (v["w"], v["h"]) != (f["v"]["w"], f["v"]["h"]) or abs(v["fps"] - f["v"]["fps"]) > 0.02:
             return False, "resolusi/fps antar video berbeda"
         if i["sig"] != f["sig"]:
             return False, "susunan stream antar video berbeda"
         if v["w"] % 2 or v["h"] % 2:
             return False, "resolusi ganjil"
-        if relaxed:
-            continue
-        if v["bitrate"] and v["bitrate"] > 8_000_000:
+        if v["bitrate"] and v["bitrate"] > br_cap(v["h"]):
             return False, f"{Path(p).name}: bitrate terlalu tinggi untuk live"
         gap = keyframe_gap(p, i["dur"])
         if gap is None or gap > 4.0:
@@ -1002,25 +963,29 @@ def _rotate_by_time(files, durs, offset: float):
     return list(files), list(durs)
 
 
+TS_PKT = 188
 PCM_RATE, PCM_CH = 44100, 2
-PCM_FRAME = PCM_CH * 2                     # byte per sample-frame (s16le stereo)
-PCM_SEC = PCM_RATE * PCM_FRAME             # byte per detik PCM (176400)
-VCHUNK = 64 * 1024                         # ukuran potongan video mentah di antrean
+PCM_SEC = PCM_RATE * PCM_CH * 2            # byte per detik PCM s16le (176400)
+
+
+def _align(n: int) -> int:
+    """Bulatkan ke bawah ke kelipatan 1 frame PCM s16le stereo (4 byte)."""
+    return max(0, int(n)) // 4 * 4
 
 
 class _Session:
-    """Satu sesi koneksi ke YouTube: feeder video/audio -> 2 pipe -> 1 ffmpeg sink (copy video, AAC audio)."""
+    """Satu sesi YouTube: video + dua PCM audio terpisah -> satu FFmpeg sink."""
 
     def __init__(self):
         self.stop = threading.Event()
-        self.live = threading.Event()                       # set setelah sink tersambung (baru boleh isi hening)
-        self.vq: queue.Queue = queue.Queue(maxsize=256)     # ±16 MB H.264 mentah
-        self.aq: queue.Queue = queue.Queue(maxsize=90)      # ±45 detik PCM
+        self.vq: queue.Queue = queue.Queue(maxsize=400)     # ±24 MB potongan TS video (penyangga jaringan)
+        self.aq: queue.Queue = queue.Queue(maxsize=30)      # ±15 detik PCM audio RANDOM
+        self.lq: queue.Queue = queue.Queue(maxsize=30)      # ±15 detik PCM audio LOOP
         self.procs: list = []
         self.error: str | None = None
         self.audio_done = False
-        self.underruns = 0
-        self.v_secs = 0.0                                   # detik video yang sudah selesai masuk antrean
+        self.opening_done = threading.Event()
+        self.program_done = threading.Event()
 
     def kill_all(self):
         self.stop.set()
@@ -1033,24 +998,18 @@ class _Session:
 
 
 class StreamManager:
-    """Live YouTube 24 jam tanpa putus dan tanpa frame rusak ("null").
+    """Live YouTube 24 jam tanpa putus.
 
     Arsitektur (satu koneksi RTMP yang TIDAK putus saat ganti video/lagu):
-      feeder video -> H.264 mentah (Annex-B, tanpa MPEG-TS) -> pipe ┐
-                                                                     ├-> ffmpeg sink -> RTMP YouTube
-      feeder audio -> PCM mentah                            -> pipe ┘
-
-    Kenapa begini:
-    - MPEG-TS yang disambung antar file menghasilkan paket korup + DTS mundur di titik pergantian
-      (continuity counter & PES terputus) -> frame rusak -> YouTube menampilkan blank/"null".
-      H.264 mentah hanya urutan frame; timestamp dibuat sink dari frame-rate -> selalu kontinu.
-    - Hanya video yang SIAP (H.264 tanpa B-frame, CFR, seragam) yang disiarkan. Video lain diseragamkan
-      dulu di background (cache). Tidak ada transkode realtime di jalur live -> tidak ada macet CPU.
-    - Koneksi ke YouTube baru dibuka setelah buffer video & audio terisi (tidak ada awal kosong).
-    - Audio selalu ada: PCM -> AAC di satu aliran; telat -> hening disisipkan (tercatat di log).
-    - Sumber audio dipilih: 'file' (video dibisukan, audio dari playlist) atau 'video' (audio asli video;
-      video tanpa audio otomatis memakai playlist audio / hening). Mode 'video' menyelaraskan audio ke
-      jumlah frame video secara eksak, jadi lipsync terjaga.
+      feeder video  -> MPEG-TS (copy / cache / transkode langsung) -> pipe ┐
+                                                                            ├-> ffmpeg sink -> RTMP YouTube
+      feeder audio  -> PCM mentah (decode lagu satu per satu)      -> pipe ┘
+    - Video berikutnya dipilih ACAK setiap pergantian (tanpa pengulangan berurutan), dan sudah disiapkan
+      di antrean sebelum video sekarang habis -> tidak ada jeda / macet.
+    - Audio berupa PCM tanpa timestamp, di-encode AAC sekali di sink -> sambungan antar lagu mulus,
+      dan jika antrean audio kosong otomatis diisi hening (audio tidak pernah 'null').
+    - Video yang belum seragam langsung diputar lewat transkode realtime, sambil diseragamkan di
+      background (cache) -> live bisa mulai seketika, tidak menunggu semua file selesai dirender.
     """
 
     def __init__(self):
@@ -1071,45 +1030,139 @@ class StreamManager:
         self.progress: dict = {}
         self.now_video = ""
         self.now_audio = ""
+        self.now_loop = ""
+        self.health = "-"
+        self._br_scale = 1.0
+        self._slow_since = 0.0
+        self._short_runs = 0
+        self._adur: dict = {}
+        self._vstage = 0
         self.switches = 0
         self.prep_info = ""
-        self.buf_v = 0.0
-        self.buf_a = 0.0
-        self.underruns = 0
         self._out_time = 0.0
         self._prog_change = time.time()
         self._lock = threading.Lock()
         self._bag: dict = {}
         self._last: dict = {}
         self._an: dict = {}
-        self._frames: dict = {}
-        self._durs: dict = {}
+        self._dur: dict = {}
+        self._audio_validation_cache: dict[tuple, tuple[bool, str]] = {}
         self._target = (1280, 720, 30)
         self._prep_q: queue.Queue = queue.Queue()
         self._prep_queued: set = set()
-        self._prep_failed: set = set()
-        self._pl: dict = {}
+        self._prep_stop = threading.Event()
         self._sess: _Session | None = None
+        self.playlist_index = 0
+        self.playlist_total = 0
+        self.playlist_name = ""
+        self._playlist_files: list[Path] = []
+        self._secret_values: list[str] = []
+        # Gain diterapkan per PCM pipe agar bisa diubah langsung saat live berlangsung.
+        self.vol = {"l": 0.6, "r": 1.0}
 
     # ---------- kontrol ----------
+    def set_volume(self, layer: str, value: float):
+        """Layer 'l' (loop) atau 'r' (random); berlaku tanpa restart live."""
+        if layer in self.vol:
+            self.vol[layer] = max(0.0, min(2.0, float(value)))
+
     def start(self, cfg: dict, max_hours: float):
         if self.running:
             return
+        self.playlist_index, self.playlist_total, self.playlist_name = 0, 0, ""
+        self._playlist_files, self._secret_values = [], [str(cfg.get("stream_key") or "")]
         self.stop_event.clear()
         self.restarts, self.finished, self.notes, self.progress = 0, False, [], {}
         self.switches, self.now_video, self.now_audio, self.prep_info = 0, "", "", ""
-        self.underruns, self.buf_v, self.buf_a = 0, 0.0, 0.0
-        self._bag, self._last, self._an, self._frames = {}, {}, {}, {}
-        self._prep_queued, self._prep_failed = set(), set()
+        self.now_loop, self._vstage = "", 0
+        self.health, self._br_scale, self._slow_since, self._short_runs = "-", 1.0, 0.0, 0
+        self._bag, self._last, self._an, self._dur = {}, {}, {}, {}
+        self._prep_queued = set()
         self._prep_q = queue.Queue()
         self.started_at = time.time()
         self.stream_key = cfg["stream_key"]
-        self.files = [Path(p) for p in (*cfg["videos"], *cfg.get("audios", []))]
+        self.files = [Path(p) for p in (*cfg["videos"], *cfg["audios"])]
+        self._adur = {}
         self.video = self.files[0] if self.files else None
         self.max_seconds = int(max_hours * 3600)
-        self.running, self.state, self.detail = True, "menyiapkan", "Menganalisis file pertama..."
+        for _k, _ck, _d in (("l", "vol_loop", 0.6), ("r", "vol_rand", 1.0)):
+            self.set_volume(_k, cfg.get(_ck, _d))
+        self.running, self.state, self.detail = True, "menyiapkan", "Memeriksa file audio dan video..."
         LOG_FILE.write_bytes(b"")
         threading.Thread(target=self._run, args=(cfg,), daemon=True).start()
+
+    def start_playlist(self, configs: list[dict]):
+        """Play full-length program configs sequentially, each with its own RTMP destination."""
+        if self.running:
+            return
+        configs = [dict(cfg) for cfg in configs]
+        if len(configs) < 2:
+            raise ValueError("Antrean multi-stream membutuhkan minimal dua stream.")
+        for idx, cfg in enumerate(configs, start=1):
+            if cfg.get("program_audio_mode", "full") not in ("full", "shuffle"):
+                raise ValueError(
+                    f"Stream {idx} harus memutar seluruh audio satu kali; mode durasi target tidak didukung."
+                )
+        self.stop_event.clear()
+        self.restarts, self.finished, self.notes, self.progress = 0, False, [], {}
+        self.switches, self.now_video, self.now_audio, self.prep_info = 0, "", "", ""
+        self.now_loop, self._vstage = "", 0
+        self.health, self._br_scale, self._slow_since, self._short_runs = "-", 1.0, 0.0, 0
+        self._bag, self._last, self._an, self._dur = {}, {}, {}, {}
+        self._prep_queued = set()
+        self._prep_q = queue.Queue()
+        self.playlist_index, self.playlist_total, self.playlist_name = 0, len(configs), ""
+        self._playlist_files = list(dict.fromkeys(
+            Path(p) for cfg in configs for p in (*cfg.get("videos", []), *cfg.get("audios", []))
+        ))
+        self._secret_values = list(dict.fromkeys(
+            str(cfg.get("stream_key") or "") for cfg in configs if cfg.get("stream_key")
+        ))
+        self.files = list(self._playlist_files)
+        self.max_seconds = 0
+        self.started_at = time.time()
+        self.running, self.state, self.detail = True, "menyiapkan", "Menyiapkan antrean multi-stream..."
+        LOG_FILE.write_bytes(b"")
+        threading.Thread(target=self._run_playlist, args=(configs,), daemon=True).start()
+
+    def _run_playlist(self, configs: list[dict]):
+        completed = 0
+        try:
+            for idx, cfg in enumerate(configs, start=1):
+                if self.stop_event.is_set():
+                    break
+                self.playlist_index = idx
+                self.playlist_name = str(cfg.get("playlist_name") or f"Stream {idx}")
+                self.started_at = time.time()
+                self.finished = False
+                self.restarts = 0
+                self.now_video, self.now_audio, self.prep_info = "", "", ""
+                self.detail = f"Stream {idx}/{len(configs)}: {self.playlist_name}"
+                self._log(f"antrean {idx}/{len(configs)} dimulai: {self.playlist_name}")
+                self.running = True
+                self._run(cfg)
+                if self.finished:
+                    completed += 1
+                    if idx < len(configs):
+                        self._log(f"stream {idx} selesai; berpindah ke stream {idx + 1}.")
+                        self.running = True
+                        self.state = "beralih"
+                        self.detail = f"Stream {idx} selesai; menyiapkan stream {idx + 1}..."
+                        continue
+                    break
+                # Gagal atau dihentikan manual: jangan diam-diam melewati stream.
+                break
+        except Exception as exc:  # noqa: BLE001
+            self.state, self.detail = "error", str(exc)
+            self._log(f"ANTREAN GAGAL: {exc}")
+        finally:
+            self.running = False
+            self._kill(self.prep_proc)
+            if completed == len(configs):
+                self.finished, self.state, self.detail = True, "selesai", "Semua stream terjadwal selesai."
+            elif self.stop_event.is_set() and self.state != "error":
+                self.state, self.detail = "idle", "Antrean dihentikan."
+            self._playlist_files = []
 
     def stop(self):
         self.stop_event.set()
@@ -1147,10 +1200,98 @@ class StreamManager:
             self._last[kind] = p
             return p
 
-    # ---------- analisis & kesiapan video ----------
-    def _cache_for(self, p: Path, cfg: dict) -> Path:
+    def _pick_video(self, cfg: dict, all_videos: list[Path], bad: set) -> tuple[Path, str]:
+        """Putar opening opsional sekali, lalu video acak berulang.
+
+        Tahap opening hanya maju sekali per sesi live, termasuk setelah koneksi stream
+        dibangun ulang. Pool opening kosong atau dinonaktifkan berarti langsung ke video acak.
+        """
+        if self._vstage == 0:
+            self._vstage = 1
+            pool = [Path(p) for p in (cfg.get("v_open") or []) if Path(p) not in bad]
+            if pool:
+                p = self._next("stage_opening", pool, True,
+                               skip=(self._last.get("v"),))
+                self._last["v"] = p
+                return p, "opening"
+
+        pool = [Path(p) for p in (cfg.get("v_rand") or []) if Path(p) not in bad]
+        pool = pool or [p for p in all_videos if p not in bad] or list(all_videos)
+        skip = (*bad, self._last.get("v"))
+        return self._next("v", pool, bool(cfg.get("shuffle", True)), skip=skip), "random"
+
+    # ---------- analisis & rencana video ----------
+    def _vdur(self, p: Path) -> float:
+        if p in self._dur:
+            return self._dur[p]
+        d = 0.0
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=duration",
+                 "-of", "csv=p=0", str(p)], capture_output=True, text=True, timeout=60).stdout.strip()
+            d = float(out.split()[0])
+        except Exception:  # noqa: BLE001
+            d = 0.0
+        if d <= 0:
+            d = media_info(p)["dur"]
+        self._dur[p] = max(d, 0.5)
+        return self._dur[p]
+
+    def _adur_of(self, p: Path) -> float:
+        if p not in self._adur:
+            self._adur[p] = max(media_info(p)["dur"], 0.5)
+        return self._adur[p]
+
+    def _validate_audio_decode(self, path: Path, duration: float) -> tuple[bool, str]:
+        """Fully decode a selected audio file before live so corrupt tracks are skipped, not cut mid-play."""
+        try:
+            stat = path.stat()
+            key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        except OSError as exc:
+            return False, str(exc)
+        cached = self._audio_validation_cache.get(key)
+        if cached is not None:
+            return cached
+
+        cmd = [*NICE, "ffmpeg", "-hide_banner", "-v", "error", "-xerror", "-nostdin",
+               "-progress", "pipe:1", "-nostats", "-i", str(path), "-map", "0:a:0", "-f", "null", "-"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=900, errors="replace")
+        except subprocess.TimeoutExpired:
+            checked = (False, "decode penuh melewati batas waktu 15 menit")
+        except Exception as exc:  # noqa: BLE001
+            checked = (False, f"{type(exc).__name__}: {exc}")
+        else:
+            decoded = None
+            for line in result.stdout.splitlines():
+                if line.startswith("out_time_us="):
+                    try:
+                        decoded = int(line.split("=", 1)[1]) / 1_000_000
+                    except ValueError:
+                        pass
+            if result.returncode != 0:
+                checked = (False, (result.stderr or f"FFmpeg keluar dengan kode {result.returncode}")[-300:])
+            elif decoded is None or decoded <= 0:
+                checked = (False, "FFmpeg tidak menghasilkan audio yang dapat diputar")
+            else:
+                tolerance = max(0.15, min(1.5, duration * 0.01))
+                if duration > 0 and decoded < duration - tolerance:
+                    checked = (False, f"audio hanya terdecode {decoded:.2f}s dari durasi {duration:.2f}s")
+                else:
+                    checked = (True, "")
+
+        if len(self._audio_validation_cache) >= 3000:
+            self._audio_validation_cache.clear()
+        self._audio_validation_cache[key] = checked
+        return checked
+
+    def _spec(self, cfg: dict) -> tuple[int, int, int, int]:
         W, H, fps = self._target
-        return self._ck(p, f"v2|{W}|{H}|{fps}|{int(cfg.get('vbr_k', 2500))}", ".mp4")
+        return W, H, fps, int(cfg.get("vbr_k") or 0) or auto_vbr(H, fps)
+
+    def _cache_for(self, p: Path, cfg: dict) -> Path:
+        W, H, fps, vbr = self._spec(cfg)
+        return self._ck(p, f"v|{W}|{H}|{fps}|{vbr}", ".mp4")
 
     @staticmethod
     def _ck(path: Path, params: str, ext: str) -> Path:
@@ -1158,72 +1299,42 @@ class StreamManager:
         h = hashlib.sha1(f"{path}|{st.st_size}|{st.st_mtime_ns}|{params}".encode()).hexdigest()[:16]
         return CACHE_DIR / f"{h}{ext}"
 
-    def _copy_ok(self, p: Path, relaxed: bool) -> bool:
-        key = (p, relaxed)
-        ok = self._an.get(key)
+    def _copy_ok(self, p: Path) -> bool:
+        ok = self._an.get(p)
         if ok is None:
             info = media_info(p)
             ok = bool(info["ok"] and info["v"])
             if ok:
-                ok, why = video_copy_ok([p], [info], relaxed)
-                if not ok:
-                    self._log(f"{p.name}: diseragamkan dulu — {why}")
+                ok, _ = video_copy_ok([p], [info])
             if ok:
                 v = info["v"]
                 W, H, fps = self._target
                 ok = (v["w"], v["h"]) == (W, H) and abs(v["fps"] - fps) <= 0.02
-                if not ok:
-                    self._log(f"{p.name}: diseragamkan dulu — beda resolusi/fps dari target {W}x{H}@{fps}")
-            self._an[key] = ok
+            self._an[p] = ok
         return ok
 
-    def _src(self, p: Path, cfg: dict) -> Path | None:
-        """File yang BOLEH disiarkan sekarang (asli atau cache). None = belum siap (diantrekan ke background)."""
-        if p in self._prep_failed:
-            return None
+    def _plan(self, p: Path, cfg: dict) -> tuple[str, Path]:
         mode = cfg.get("vmode", "auto")
         cache = self._cache_for(p, cfg)
         if cache.exists():
-            return cache
-        if mode != "normalize" and self._copy_ok(p, relaxed=(mode == "copy")):
-            return p
+            return "copy", cache
+        if mode == "copy":
+            return "copy", p
+        if mode != "normalize" and self._copy_ok(p):
+            return "copy", p
         self._enqueue_prep(p)
-        return None
+        return "live", p
 
-    def _frames_of(self, src: Path) -> int:
-        n = self._frames.get(src)
-        if n:
-            return n
-        info = media_info(src)
-        n = (info["v"] or {}).get("nb_frames", 0) if info["ok"] else 0
-        if n <= 0:
-            try:
-                out = subprocess.run(
-                    ["ffprobe", "-v", "error", "-count_packets", "-select_streams", "v:0",
-                     "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(src)],
-                    capture_output=True, text=True, timeout=900).stdout.strip()
-                n = int(out.split(",")[0])
-            except Exception:  # noqa: BLE001
-                n = 0
-        if n <= 0:
-            n = max(1, int(round(info["dur"] * self._target[2])))
-        self._frames[src] = n
-        return n
-
-    def _dur_of(self, src: Path) -> float:
-        d = self._durs.get(src)
-        if d is None:
-            d = self._durs[src] = max(media_info(src)["dur"], 0.5)
-        return d
-
-    def _venc(self, cfg: dict) -> list[str]:
-        W, H, fps = self._target
-        vbr = int(cfg.get("vbr_k", 2500))
+    def _venc(self, cfg: dict, scale: float = 1.0, preset: str = "superfast") -> list[str]:
+        """Encoder seragam. Bitrate nyaris konstan (maxrate = bitrate, buffer kecil) -> aliran data ke
+        YouTube rata. `scale` < 1 dipakai penurunan otomatis saat jaringan lambat."""
+        W, H, fps, vbr = self._spec(cfg)
+        vbr = max(500, int(vbr * scale))
         vf = (f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
               f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},format=yuv420p")
         g = str(fps * 2)
-        return ["-vf", vf, "-c:v", "libx264", "-preset", "superfast", "-profile:v", "high",
-                "-b:v", f"{vbr}k", "-maxrate", f"{int(vbr * 1.2)}k", "-bufsize", f"{vbr * 2}k",
+        return ["-vf", vf, "-c:v", "libx264", "-preset", preset, "-profile:v", "high",
+                "-b:v", f"{vbr}k", "-maxrate", f"{vbr}k", "-bufsize", f"{int(vbr * 1.5)}k",
                 "-g", g, "-keyint_min", g, "-sc_threshold", "0", "-bf", "0"]
 
     # ---------- penyeragaman di background ----------
@@ -1236,7 +1347,8 @@ class StreamManager:
 
     def _prep_worker(self, cfg: dict):
         free_min = float(cfg.get("disk_min_gb", 0.5)) * 1024**3
-        while not self.stop_event.is_set() and self.running:
+        prep_stop = self._prep_stop
+        while not self.stop_event.is_set() and not prep_stop.is_set() and self.running:
             try:
                 p = self._prep_q.get(timeout=1)
             except queue.Empty:
@@ -1247,8 +1359,6 @@ class StreamManager:
                     continue
                 if shutil.disk_usage(BASE).free < free_min:
                     self.prep_info = "Cache dilewati: disk hampir penuh."
-                    self._log(f"cache dilewati (disk penuh): {p.name}")
-                    self._prep_failed.add(p)
                     continue
                 part = Path(str(dst) + ".part")
                 part.unlink(missing_ok=True)
@@ -1257,7 +1367,7 @@ class StreamManager:
                 cmd = ["nice", "-n", "15"] if shutil.which("nice") else []
                 cmd += ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
                         "-progress", "pipe:1", "-nostats", "-i", str(p), "-map", "0:v:0", "-an",
-                        *self._venc(cfg), "-movflags", "+faststart", "-f", "mp4", str(part)]
+                        *self._venc(cfg, preset="veryfast"), "-movflags", "+faststart", "-f", "mp4", str(part)]
                 with open(LIVE_DIR / "prep_err.log", "wb") as ef:
                     self.prep_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, text=True,
                                                       stdin=subprocess.DEVNULL)
@@ -1274,18 +1384,14 @@ class StreamManager:
                     self._log(f"cache siap: {p.name}")
                 else:
                     part.unlink(missing_ok=True)
-                    if not self.stop_event.is_set():
-                        self._prep_failed.add(p)
-                        tail = (LIVE_DIR / "prep_err.log").read_text(errors="replace")[-200:]
-                        self._log(f"cache gagal: {p.name}: {tail}")
+                    self._log(f"cache gagal: {p.name}")
             except Exception as e:  # noqa: BLE001
-                self._prep_failed.add(p)
                 self._log(f"prep error: {e}")
             finally:
                 self.prep_info = ""
         self.prep_info = ""
 
-    # ---------- util feeder ----------
+    # ---------- feeder ----------
     def _put(self, sess: _Session, q: queue.Queue, item) -> bool:
         while not sess.stop.is_set():
             try:
@@ -1295,106 +1401,55 @@ class StreamManager:
                 continue
         return False
 
-    @staticmethod
-    def _pcm_cmd(path: Path, seconds: float | None = None, ss: float | None = None) -> list[str]:
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
-        if ss:
-            cmd += ["-ss", f"{ss:.3f}"]
-        cmd += ["-i", str(path), "-map", "0:a:0", "-vn", "-ar", str(PCM_RATE), "-ac", str(PCM_CH)]
-        if seconds:
-            cmd += ["-t", f"{seconds:.6f}"]
-        return cmd + ["-f", "s16le", "pipe:1"]
-
-    def _pump(self, sess: _Session, q: queue.Queue, cmd: list[str], limit: int | None = None) -> tuple[int, int]:
-        """Jalankan ffmpeg PCM dan dorong stdout ke antrean (maks `limit` byte). Return (byte_terkirim, returncode)."""
-        sent = 0
-        with open(LIVE_DIR / "feed_a.log", "wb") as ef:
-            pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL)
-            sess.procs.append(pr)
-            try:
-                while not sess.stop.is_set():
-                    want = PCM_SEC // 2 if limit is None else min(PCM_SEC // 2, limit - sent)
-                    if want <= 0:
-                        break
-                    buf = pr.stdout.read(want)
-                    if not buf:
-                        break
-                    buf = buf[:len(buf) - len(buf) % PCM_FRAME]
-                    if buf and not self._put(sess, q, buf):
-                        break
-                    sent += len(buf)
-            finally:
-                try:
-                    pr.stdout.close()
-                except Exception:  # noqa: BLE001
-                    pass
-                if pr.poll() is None:
-                    pr.kill()
-                pr.wait()
-                if pr in sess.procs:
-                    sess.procs.remove(pr)
-        return sent, pr.returncode
-
-    def _push_zeros(self, sess: _Session, nbytes: int):
-        step = PCM_SEC // 2
-        while nbytes > 0 and not sess.stop.is_set():
-            n = min(step, nbytes)
-            if not self._put(sess, sess.aq, bytes(n)):
-                return
-            nbytes -= n
-
-    # ---------- feeder video ----------
-    def _video_feeder(self, sess: _Session, cfg: dict, videos: list[Path], audios: list[Path]):
-        shuffle = bool(cfg.get("shuffle", True))
-        from_video = cfg.get("audio_src", "file") == "video"
-        fps = self._target[2]
-        fails, bad = 0, set()
-        frames_acc = samples_acc = 0
+    def _video_feeder(self, sess: _Session, cfg: dict, videos: list[Path]):
+        T, fails, bad = 2.0, 0, set()
         errlog = LIVE_DIR / "feed_v.log"
+        program_mode = bool(cfg.get("program_mode"))
+        ending_started = False
         try:
             while not sess.stop.is_set():
-                ready = []
-                for v in videos:
-                    if v in bad:
-                        continue
-                    try:
-                        s = self._src(v, cfg)
-                    except Exception as e:  # noqa: BLE001
-                        bad.add(v)
-                        self._log(f"video dilewati ({v.name}): {e}")
-                        continue
-                    if s is not None:
-                        ready.append((v, s))
-                if not ready:
-                    if all(v in bad or v in self._prep_failed for v in videos):
-                        raise RuntimeError("Semua video gagal disiapkan/dibaca.")
-                    time.sleep(1)
+                if program_mode and sess.audio_done:
+                    endings = [Path(p) for p in (cfg.get("v_end") or []) if Path(p) not in bad]
+                    if not endings:
+                        raise RuntimeError("Video end tidak tersedia atau gagal dibaca.")
+                    if ending_started:
+                        return
+                    p = self._next("v_end", endings, True)
+                    stage_name = "end"
+                    ending_started = True
+                else:
+                    p, stage_name = self._pick_video(cfg, videos, bad)
+                try:
+                    mode, src = self._plan(p, cfg)
+                    dur = self._vdur(src if mode == "copy" else p)
+                except Exception as e:  # noqa: BLE001
+                    bad.add(p)
+                    self._log(f"video dilewati ({p.name}): {e}")
+                    if program_mode and stage_name == "opening":
+                        sess.opening_done.set()
+                    fails += 1
+                    if fails > 5:
+                        raise RuntimeError("Video terus gagal dibaca.")
                     continue
-                p = self._next("v", [r[0] for r in ready], shuffle)
-                src = dict(ready)[p]
-
-                at, has_a = None, False
-                if from_video:
-                    frames_acc += self._frames_of(src)
-                    target = round(frames_acc * PCM_RATE / fps)      # audio dipaku ke jumlah frame (lipsync eksak)
-                    nbytes, samples_acc = (target - samples_acc) * PCM_FRAME, target
-                    has_a = media_info(p)["a"] is not None
-                if not self._put(sess, sess.vq, ("mark", p.name, "asli" if src == p else "cache")):
+                if not self._put(sess, sess.vq, ("mark", p.name, f"{stage_name} · {'copy' if mode == 'copy' else 'transkode langsung'}")):
                     return
-                if from_video:
-                    at = threading.Thread(target=self._audio_for_video,
-                                          args=(sess, cfg, audios, p, nbytes, has_a), daemon=True)
-                    at.start()
-
-                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(src),
-                       "-map", "0:v:0", "-an", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb",
-                       "-f", "h264", "pipe:1"]
+                cmd = [*(NICE if mode == "live" else []), "ffmpeg", "-hide_banner", "-loglevel", "error",
+                       "-nostdin", "-fflags", "+genpts", "-i", str(src), "-map", "0:v:0", "-an"]
+                cmd += (["-c:v", "copy"] if mode == "copy"
+                        else self._venc(cfg, self._br_scale))
+                cmd += ["-output_ts_offset", f"{T:.3f}", "-muxdelay", "0", "-muxpreload", "0",
+                        "-f", "mpegts", "pipe:1"]
                 got = 0
+                cut_for_end = False
                 with open(errlog, "wb") as ef:
                     pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL)
                     sess.procs.append(pr)
                     while not sess.stop.is_set():
-                        buf = pr.stdout.read(VCHUNK)
+                        if program_mode and sess.audio_done and stage_name not in ("opening", "end"):
+                            cut_for_end = True
+                            self._kill(pr)
+                            break
+                        buf = pr.stdout.read(TS_PKT * 512)
                         if not buf:
                             break
                         got += len(buf)
@@ -1402,136 +1457,245 @@ class StreamManager:
                             break
                     pr.stdout.close()
                     pr.wait()
-                if pr in sess.procs:
+                if sess.procs and pr in sess.procs:
                     sess.procs.remove(pr)
-                if at:
-                    at.join()
                 if sess.stop.is_set():
                     return
+                if cut_for_end:
+                    self._log(f"video utama dihentikan karena audio selesai: {p.name}")
+                    continue
                 if pr.returncode != 0 or got == 0:
                     bad.add(p)
                     fails += 1
                     tail = errlog.read_text(errors="replace")[-200:]
                     self._log(f"video gagal ({p.name}): {tail}")
-                    if from_video:      # audio file ini sudah antre -> sesi diulang bersih agar tetap sinkron
-                        raise RuntimeError(f"Video gagal dibaca: {p.name}")
+                    if program_mode and stage_name == "opening":
+                        sess.opening_done.set()
                     if fails > 5 or len(bad) >= len(videos):
                         raise RuntimeError(f"Video gagal diputar: {p.name}: {tail}")
                     continue
                 fails = 0
-                sess.v_secs += self._dur_of(src)
+                if program_mode:
+                    marker = "program_done" if stage_name == "end" else "stage_end"
+                    if not self._put(sess, sess.vq, (marker, stage_name)):
+                        return
+                T += dur
         except Exception as e:  # noqa: BLE001
             sess.error = f"feeder video: {e}"
             sess.kill_all()
 
-    # ---------- feeder audio ----------
-    def _audio_feeder(self, sess: _Session, cfg: dict, audios: list[Path]):
-        """Mode 'file': playlist audio berjalan sendiri, lagu demi lagu."""
-        shuffle = bool(cfg.get("shuffle", True))
-        loop = bool(cfg.get("loop_audio", True))
-        played, fails, bad = 0, 0, set()
+    def _loop_audio_feeder(self, sess: _Session, audio: Path, q: queue.Queue):
+        """Decode one loop file continuously; FFmpeg performs the file loop without transition gaps."""
+        errlog = LIVE_DIR / "feed_a_loop.log"
+        step, got, marked = PCM_SEC // 2, 0, False
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin", "-re", "-stream_loop", "-1",
+               "-i", str(audio), "-map", "0:a:0", "-vn", "-f", "s16le", "-ar", str(PCM_RATE),
+               "-ac", str(PCM_CH), "pipe:1"]
+        try:
+            with open(errlog, "wb") as ef:
+                pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL)
+                sess.procs.append(pr)
+                while not sess.stop.is_set():
+                    buf = pr.stdout.read(step)
+                    if not buf:
+                        break
+                    got += len(buf)
+                    if not marked:
+                        if not self._put(sess, q, ("mark", audio.name, "")):
+                            break
+                        marked = True
+                    if not self._put(sess, q, buf):
+                        break
+                pr.stdout.close()
+                pr.wait()
+            if pr in sess.procs:
+                sess.procs.remove(pr)
+            if sess.stop.is_set():
+                return
+            if got == 0 or pr.returncode != 0:
+                detail = errlog.read_text(errors="replace")[-200:]
+                raise RuntimeError(f"Audio LOOP gagal diputar: {audio.name}. {detail}")
+        except Exception as e:  # noqa: BLE001
+            sess.error = f"feeder audio loop: {e}"
+            sess.kill_all()
+
+    def _random_audio_feeder(self, sess: _Session, audios: list[Path], q: queue.Queue):
+        """Play complete audio files in random order, with no crossfade or segment trimming."""
+        fails, bad = 0, set()
+        errlog = LIVE_DIR / "feed_a_random.log"
+        step = PCM_SEC // 2
         try:
             while not sess.stop.is_set():
-                if not loop and played >= len(audios):
-                    break
-                p = self._next("a", audios, shuffle and loop, skip=bad)
-                if not self._put(sess, sess.aq, ("mark", p.name, "")):
-                    return
-                sent, rc = self._pump(sess, sess.aq, self._pcm_cmd(p))
+                audio = self._next("a_r", audios, True, skip=bad)
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin", "-i", str(audio),
+                       "-map", "0:a:0", "-vn", "-f", "s16le", "-ar", str(PCM_RATE), "-ac", str(PCM_CH),
+                       "pipe:1"]
+                got, marked = 0, False
+                with open(errlog, "wb") as ef:
+                    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL)
+                    sess.procs.append(pr)
+                    while not sess.stop.is_set():
+                        buf = pr.stdout.read(step)
+                        if not buf:
+                            break
+                        got += len(buf)
+                        if not marked:
+                            if not self._put(sess, q, ("mark", audio.name, "")):
+                                break
+                            marked = True
+                        if not self._put(sess, q, buf):
+                            break
+                    pr.stdout.close()
+                    pr.wait()
+                if pr in sess.procs:
+                    sess.procs.remove(pr)
                 if sess.stop.is_set():
                     return
-                played += 1
-                if rc != 0 or sent == 0:
-                    bad.add(p)
+                if got == 0 or pr.returncode != 0:
+                    bad.add(audio)
                     fails += 1
-                    tail = (LIVE_DIR / "feed_a.log").read_text(errors="replace")[-200:]
-                    self._log(f"audio gagal ({p.name}): {tail}")
+                    detail = errlog.read_text(errors="replace")[-200:]
+                    self._log(f"audio random gagal ({audio.name}): {detail}")
                     if fails > 5 or len(bad) >= len(audios):
-                        raise RuntimeError(f"Audio tidak bisa didecode: {p.name}")
+                        raise RuntimeError(f"Audio RANDOM tidak bisa didecode: {audio.name}")
                     continue
                 fails = 0
-            sess.audio_done = True
-            self._put(sess, sess.aq, None)
         except Exception as e:  # noqa: BLE001
-            sess.error = f"feeder audio: {e}"
+            sess.error = f"feeder audio random: {e}"
             sess.kill_all()
 
-    def _audio_for_video(self, sess: _Session, cfg: dict, audios: list[Path], p: Path, nbytes: int, has_a: bool):
-        """Mode 'video': audio sepanjang tepat satu video (aslinya, atau playlist/hening jika video tanpa audio)."""
+    def _program_audio_feeder(self, sess: _Session, audios: list[Path], cfg: dict, q: queue.Queue):
+        """Play a selected album once or randomly until its target, then signal audio completion."""
+        errlog = LIVE_DIR / "feed_a_program.log"
+        mode = cfg.get("program_audio_mode", "full")
+        remaining = max(0.0, float(cfg.get("program_audio_seconds") or 0.0))
+        bad: set[Path] = set()
+        fails = 0
+        step = PCM_SEC // 2
         try:
-            if has_a:
-                self._put(sess, sess.aq, ("mark", p.name, "audio dari video"))
-                sent, rc = self._pump(sess, sess.aq, self._pcm_cmd(p, seconds=nbytes / PCM_SEC), limit=nbytes)
-                if sent < nbytes and not sess.stop.is_set():
-                    if sent == 0:
-                        self._log(f"audio video tidak terbaca, diisi hening: {p.name}")
-                    self._push_zeros(sess, nbytes - sent)     # audio lebih pendek dari video -> sisanya hening
-            else:
-                self._fill_from_playlist(sess, cfg, audios, nbytes)
+            while not sess.stop.is_set() and not sess.opening_done.wait(0.4):
+                pass
+            if sess.stop.is_set():
+                return
+
+            playlist = list(audios)
+            if mode in ("target", "shuffle"):
+                random.shuffle(playlist)
+            while playlist and not sess.stop.is_set():
+                audio = playlist.pop(0)
+                cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-xerror", "-nostdin",
+                       "-i", str(audio)]
+                if mode == "target":
+                    if remaining <= 0.02:
+                        break
+                    cmd += ["-t", f"{remaining:.3f}"]
+                cmd += ["-map", "0:a:0", "-vn", "-f", "s16le",
+                        "-ar", str(PCM_RATE), "-ac", str(PCM_CH), "pipe:1"]
+                got, marked = 0, False
+                with open(errlog, "wb") as ef:
+                    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=ef, stdin=subprocess.DEVNULL)
+                    sess.procs.append(pr)
+                    while not sess.stop.is_set():
+                        buf = pr.stdout.read(step)
+                        if not buf:
+                            break
+                        got += len(buf)
+                        if not marked:
+                            if not self._put(sess, q, ("mark", audio.name, "program")):
+                                break
+                            marked = True
+                        if not self._put(sess, q, buf):
+                            break
+                    pr.stdout.close()
+                    pr.wait()
+                if pr in sess.procs:
+                    sess.procs.remove(pr)
+                if sess.stop.is_set():
+                    return
+                if got == 0 or pr.returncode != 0:
+                    bad.add(audio)
+                    fails += 1
+                    detail = errlog.read_text(errors="replace")[-200:]
+                    self._log(f"audio program gagal ({audio.name}): {detail}")
+                    if fails > 5 or len(bad) >= len(audios):
+                        raise RuntimeError(f"Audio program tidak bisa diputar: {audio.name}")
+                    playlist = [p for p in audios if p not in bad]
+                    if mode in ("target", "shuffle"):
+                        random.shuffle(playlist)
+                    continue
+
+                fails = 0
+                if mode == "target":
+                    remaining -= got / PCM_SEC
+                    if remaining > 0.02:
+                        playlist = [p for p in audios if p not in bad]
+                        random.shuffle(playlist)
+
+            if not sess.stop.is_set():
+                if not self._put(sess, q, ("audio_complete",)):
+                    return
+                self._log("audio program selesai; menunggu video end.")
         except Exception as e:  # noqa: BLE001
-            sess.error = f"audio video: {e}"
+            sess.error = f"feeder audio program: {e}"
             sess.kill_all()
 
-    def _fill_from_playlist(self, sess: _Session, cfg: dict, audios: list[Path], nbytes: int):
-        """Ambil `nbytes` PCM dari playlist audio, lanjut dari posisi terakhir (lintas video)."""
-        st, need, fails = self._pl, nbytes, 0
-        shuffle = bool(cfg.get("shuffle", True))
-        while need > 0 and not sess.stop.is_set():
-            if not audios or fails > 10:
-                break
-            if st["track"] is None:
-                cand = [a for a in audios if a not in st["bad"]]
-                if not cand:
-                    break
-                st["track"], st["pos"] = self._next("a", cand, shuffle), 0.0
-                st["dur"] = media_info(st["track"])["dur"]
-                self._put(sess, sess.aq, ("mark", st["track"].name, "playlist"))
-            take = min(need, int(max(st["dur"] - st["pos"], 0.0) * PCM_RATE) * PCM_FRAME)
-            if take < PCM_FRAME * 64:                          # sisa lagu terlalu pendek -> lagu berikutnya
-                st["track"] = None
-                fails += 1
-                continue
-            sent, _rc = self._pump(sess, sess.aq,
-                                   self._pcm_cmd(st["track"], seconds=take / PCM_SEC, ss=st["pos"]), limit=take)
-            if sent == 0:
-                st["bad"].add(st["track"])
-                st["track"] = None
-                fails += 1
-                continue
-            fails = 0
-            need -= sent
-            st["pos"] += sent / PCM_SEC
-            if sent < take or st["pos"] >= st["dur"] - 0.02:
-                st["track"] = None
-        if need > 0 and not sess.stop.is_set():
-            self._push_zeros(sess, need)                       # tidak ada audio -> hening (tetap tersinkron)
+    @staticmethod
+    def _gain(buf: bytes, prev: float, target: float) -> bytes:
+        """Terapkan gain pada PCM s16le stereo, naik/turun halus dari `prev` ke `target` dalam satu potongan
+        (tanpa bunyi 'klik'), dengan soft-clip lembut agar volume besar tidak pecah."""
+        n = _align(len(buf))
+        if np is None or n == 0 or (prev == 1.0 and target == 1.0):
+            return buf
+        x = np.frombuffer(buf, dtype="<i2", count=n // 2).astype(np.float32) / 32768.0
+        ramp = np.repeat(np.linspace(prev, target, n // 4, dtype=np.float32), 2)
+        y = x * ramp
+        a = np.abs(y)
+        knee = 0.85
+        y = np.where(a > knee, np.sign(y) * (knee + (1 - knee) * np.tanh((a - knee) / (1 - knee))), y)
+        return (y * 32767.0).astype("<i2").tobytes() + bytes(buf[n:])
 
-    # ---------- penulis pipe ----------
-    def _writer(self, sess: _Session, fobj, q: queue.Queue, silence: bytes | None):
-        """Tulis antrean ke pipe sink. Audio telat -> sisipkan hening agar aliran tidak pernah kosong."""
+    def _writer(self, sess: _Session, fobj, q: queue.Queue, silence: bytes | None, kind: str):
+        """Write one live PCM/video pipe; an inactive audio source feeds silence to keep mux input valid."""
+        g_prev = self.vol.get(kind, 1.0)
         try:
             while not sess.stop.is_set():
                 try:
                     buf = q.get(timeout=0.4)
                 except queue.Empty:
-                    if silence is not None and sess.live.is_set():
-                        sess.underruns += 1
-                        self.underruns = sess.underruns
-                        if sess.underruns in (1, 10, 100, 1000):
-                            self._log(f"audio telat, hening disisipkan (total {sess.underruns}x)")
+                    if silence is not None:
                         fobj.write(silence)
                         fobj.flush()
                     continue
                 if buf is None:
                     break
-                if isinstance(buf, tuple):          # penanda: file ini mulai masuk antrean kirim
-                    if silence is None:
-                        self.now_video, self.switches = buf[1], self.switches + 1
-                        self._log(f"video -> {buf[1]} ({buf[2]})")
+                if isinstance(buf, tuple):          # penanda: file ini mulai benar-benar dikirim
+                    if kind == "v":
+                        if buf[0] == "stage_end":
+                            if buf[1] == "opening":
+                                sess.opening_done.set()
+                                self._log("opening selesai; audio program dimulai.")
+                        elif buf[0] == "program_done":
+                            sess.program_done.set()
+                            self._log("video end selesai; streaming dihentikan.")
+                        else:
+                            self.now_video, self.switches = buf[1], self.switches + 1
+                            self._log(f"video -> {buf[1]} ({buf[2]})")
+                    elif kind == "l":
+                        self.now_loop = buf[1]
+                        self._log(f"audio loop -> {buf[1]}")
+                    elif buf[0] == "audio_complete":
+                        sess.audio_done = True
+                        self.now_audio = "Audio selesai"
+                        self._log("audio program selesai dikirim.")
                     else:
                         self.now_audio = buf[1]
-                        self._log(f"audio -> {buf[1]}" + (f" ({buf[2]})" if buf[2] else ""))
+                        if buf[1]:
+                            self._log(f"audio random -> {buf[1]}")
                     continue
+                if kind in self.vol:
+                    g_now = self.vol[kind]
+                    buf = self._gain(buf, g_prev, g_now)
+                    g_prev = g_now
                 fobj.write(buf)
                 fobj.flush()
         except (BrokenPipeError, ValueError, OSError):
@@ -1543,25 +1707,50 @@ class StreamManager:
                 pass
 
     # ---------- sink ----------
-    def build_cmd(self, cfg: dict, vfd: int, afd: int) -> list[str]:
+    def build_cmd(self, cfg: dict, vfd: int, lfd: int, rfd: int) -> list[str]:
+        """Mux video with LOOP + RANDOM PCM into one limited AAC audio stream."""
         out = cfg.get("_output") or (cfg["rtmp_url"].rstrip("/") + "/" + cfg["stream_key"])
-        fps = self._target[2]
+
+        def vol(key, default):
+            return max(0.0, min(2.0, float(cfg.get(key, default))))
+        vl, vr = vol("vol_loop", 0.6), vol("vol_rand", 1.0)
+        if np is not None:
+            vl = vr = 1.0       # slider gain is applied in _writer so it can change while live
+        pcm = ["-thread_queue_size", "512", "-re", "-f", "s16le",
+               "-ar", str(PCM_RATE), "-ac", str(PCM_CH)]
+        fc = (f"[1:a]aformat=sample_fmts=fltp:sample_rates={PCM_RATE}:channel_layouts=stereo,"
+              f"volume={vl:.2f}[loop];"
+              f"[2:a]aformat=sample_fmts=fltp:sample_rates={PCM_RATE}:channel_layouts=stereo,"
+              f"volume={vr:.2f}[random];"
+              "[loop][random]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0,"
+              "alimiter=limit=0.95:level=0,aresample=async=1000:first_pts=0[aout]")
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "info", "-nostdin", "-nostats",
                "-progress", "pipe:1",
-               "-probesize", "2M", "-analyzeduration", "2M",
-               "-thread_queue_size", "1024", "-re", "-f", "h264", "-framerate", str(fps), "-i", f"pipe:{vfd}",
-               "-thread_queue_size", "1024", "-re", "-f", "s16le", "-ar", str(PCM_RATE), "-ac", str(PCM_CH),
-               "-i", f"pipe:{afd}",
-               "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-               "-c:a", "aac", "-b:a", "128k", "-ar", str(PCM_RATE), "-ac", "2",
-               "-af", "aresample=async=1000"]
-        if cfg.get("audio_src", "file") == "file" and not cfg.get("loop_audio", True):
-            cmd += ["-shortest"]
-        cmd += ["-flvflags", "no_duration_filesize", "-f", "flv", out]
+               "-probesize", "2M", "-analyzeduration", "2M", "-thread_queue_size", "1024",
+               "-fflags", "+genpts", "-re", "-f", "mpegts", "-i", f"pipe:{vfd}",
+               *pcm, "-i", f"pipe:{lfd}",
+               *pcm, "-i", f"pipe:{rfd}"]
+        cmd += ["-filter_complex", fc,
+                "-map", "0:v:0", "-map", "[aout]", "-c:v", "copy",
+                "-c:a", "aac", "-b:a", "160k", "-ar", str(PCM_RATE), "-ac", "2",
+                "-max_muxing_queue_size", "4096", "-flush_packets", "1",
+                "-flvflags", "no_duration_filesize"]
+        if out.lower().startswith(("rtmp://", "rtmps://")):
+            # koneksi mati diam-diam terdeteksi ±20 dtk -> sesi cepat dibangun ulang
+            cmd += ["-rtmp_live", "live", "-rw_timeout", "20000000"]
+        cmd += ["-f", "flv", out]
         return cmd
+
+    def _downshift(self, why: str):
+        """Turunkan bitrate untuk video yang di-transkode (copy tidak bisa diubah) saat jaringan bermasalah."""
+        if self._br_scale > 0.55:
+            self._br_scale = round(max(0.55, self._br_scale - 0.15), 2)
+            self._log(f"AUTO BITRATE: {why} -> bitrate transkode {int(self._br_scale * 100)}% dari target.")
 
     def _read_progress(self, proc):
         cur: dict = {}
+        smp = None                      # (waktu dinding, out_time) awal jendela ukur 10 detik
+        slow = 0
         for line in proc.stdout:
             line = line.strip()
             if "=" not in line:
@@ -1576,64 +1765,64 @@ class StreamManager:
                 if t != self._out_time:
                     self._out_time, self._prog_change = t, time.time()
             elif k == "progress":
+                now, t = time.time(), self._out_time
+                if smp is None:
+                    smp = (now, t)
+                elif now - smp[0] >= 10 and t > 0:
+                    rate = (t - smp[1]) / (now - smp[0])      # 1.00 = tepat waktu nyata
+                    smp = (now, t)
+                    if rate >= 0.97:
+                        self.health, slow = "stabil", 0
+                    elif rate >= 0.90:
+                        self.health, slow = "agak lambat", 0
+                    else:
+                        self.health, slow = "lambat", slow + 1
+                        if slow >= 4:                          # ±40 detik berturut-turut
+                            self._downshift("jaringan upload lambat")
+                            slow = 0
                 self.progress = {"speed": cur.get("speed", ""), "bitrate": cur.get("bitrate", ""),
                                  "size": cur.get("total_size", ""), "out_time": self._out_time}
                 cur = {}
 
     def _session(self, cfg: dict, videos, audios, deadline) -> str:
         sess = _Session()
+        if cfg.get("program_mode"):
+            # Keep the scheduled transition responsive; legacy mode retains its larger network buffer.
+            sess.vq = queue.Queue(maxsize=4)
         self._sess = sess
-        self._pl = {"track": None, "pos": 0.0, "dur": 0.0, "bad": set()}
         vr, vw = os.pipe()
-        ar, aw = os.pipe()
-        self.state, self.detail = "menyiapkan", "Mengisi buffer video & audio sebelum tayang..."
-        silence = bytes(PCM_SEC // 2)
-        from_video = cfg.get("audio_src", "file") == "video"
-        feeders = [(self._video_feeder, (sess, cfg, videos, audios))]
-        if not from_video:
-            feeders.append((self._audio_feeder, (sess, cfg, audios)))
-        feeders += [(self._writer, (sess, os.fdopen(vw, "wb", buffering=0), sess.vq, None)),
-                    (self._writer, (sess, os.fdopen(aw, "wb", buffering=0), sess.aq, silence))]
-        for target, args in feeders:
-            threading.Thread(target=target, args=args, daemon=True).start()
-
-        # Buka koneksi ke YouTube HANYA setelah buffer terisi -> tidak ada awal kosong / macet.
-        t_wait, early = time.time(), None
-        while not ((sess.vq.qsize() >= 24 or sess.v_secs >= 5) and (sess.aq.qsize() >= 6 or sess.audio_done)):
-            if self.stop_event.is_set():
-                early = "stop"
-            elif deadline and time.time() >= deadline:
-                early = "deadline"
-            elif sess.error:
-                early = "error"
-            elif time.time() - t_wait > 60:
-                self._log("buffer awal lambat (>60 dtk), tetap mulai.")
-                break
-            if early:
-                break
-            time.sleep(0.3)
-        if early:
-            sess.kill_all()
-            os.close(vr)
-            os.close(ar)
-            self._sess = None
-            if early == "error":
-                self._log(f"SESI ERROR: {sess.error}")
-                self.detail = sess.error or ""
-            return early
-
+        lr, lw = os.pipe()
+        rr, rw = os.pipe()
         self.state, self.detail = "menghubungkan", "Memulai ffmpeg..."
+        self.health = "-"
         self._out_time, self._prog_change = 0.0, time.time()
         t_launch = time.time()
-        cmd = self.build_cmd(cfg, vr, ar)
+        cmd = self.build_cmd(cfg, vr, lr, rr)
+        fds = (vr, lr, rr)
         with open(LOG_FILE, "ab") as log:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log, text=True,
-                                         stdin=subprocess.DEVNULL, pass_fds=(vr, ar))
-        os.close(vr)
-        os.close(ar)
-        sess.live.set()
+                                         stdin=subprocess.DEVNULL, pass_fds=fds)
+        for x in fds:
+            os.close(x)
         sess.procs.append(self.proc)
         threading.Thread(target=self._read_progress, args=(self.proc,), daemon=True).start()
+        silence = bytes(PCM_SEC // 2)
+        loops = [Path(p) for p in (cfg.get("a_loop") or [])][:1]
+        rands = [Path(p) for p in (cfg.get("a_rand") or [])]
+        work = [(self._video_feeder, (sess, cfg, videos)),
+                (self._writer, (sess, os.fdopen(vw, "wb", buffering=0), sess.vq, None, "v")),
+                (self._writer, (sess, os.fdopen(lw, "wb", buffering=0), sess.lq, silence, "l")),
+                (self._writer, (sess, os.fdopen(rw, "wb", buffering=0), sess.aq, silence, "r"))]
+        if loops:
+            work.append((self._loop_audio_feeder, (sess, loops[0], sess.lq)))
+        if cfg.get("program_mode") and (not cfg.get("v_open") or self._vstage > 0):
+            sess.opening_done.set()
+        if cfg.get("program_mode"):
+            work.append((self._program_audio_feeder, (sess, rands, cfg, sess.aq)))
+        elif rands:
+            work.append((self._random_audio_feeder, (sess, rands, sess.aq)))
+        for target, args in work:
+            threading.Thread(target=target, args=args, daemon=True).start()
 
         reason = "died"
         while True:
@@ -1646,16 +1835,17 @@ class StreamManager:
             if sess.error:
                 reason = "error"
                 break
+            if sess.program_done.is_set():
+                reason = "finished"
+                break
             if self.proc.poll() is not None:
                 reason = "died"
                 break
             now = time.time()
-            self.buf_v = sess.vq.qsize() * VCHUNK / 1e6
-            self.buf_a = sess.aq.qsize() * 0.5
             if self._out_time > 0:
                 self.state, self.detail = "live", ""
-            if now - t_launch > 90 and now - self._prog_change > 30:
-                self._log("Stream macet >30 detik, sesi di-restart.")
+            if now - t_launch > 60 and now - self._prog_change > 25:
+                self._log("Stream macet >25 detik, sesi di-restart.")
                 reason = "stalled"
                 break
             time.sleep(1)
@@ -1663,8 +1853,6 @@ class StreamManager:
         sess.kill_all()
         self._kill(self.proc)
         self._sess = None
-        if reason == "died" and rc == 0 and not from_video and not cfg.get("loop_audio", True):
-            reason = "finished"
         if reason == "error":
             self._log(f"SESI ERROR: {sess.error}")
             self.detail = sess.error or ""
@@ -1672,69 +1860,100 @@ class StreamManager:
 
     # ---------- loop utama ----------
     def _run(self, cfg: dict):
+        # Each scheduled item is an independent program; do not carry its opening,
+        # shuffle bags, media probes, or background preparation queue into the next one.
+        self.set_volume("l", cfg.get("vol_loop", 0.6))
+        self.set_volume("r", cfg.get("vol_rand", 1.0))
+        self._vstage = 0
+        self._bag, self._last, self._an, self._dur = {}, {}, {}, {}
+        self._prep_queued = set()
+        self._prep_q = queue.Queue()
+        self._prep_stop = threading.Event()
         videos = [Path(p) for p in cfg["videos"]]
-        audios = [Path(p) for p in cfg.get("audios", [])]
-        from_video = cfg.get("audio_src", "file") == "video"
+        requested_loop = [Path(p) for p in (cfg.get("a_loop") or [])][:1]
+        requested_random = [Path(p) for p in (cfg.get("a_rand") or [])]
+        requested_audio = list(dict.fromkeys([*requested_loop, *requested_random]))
+        audio_skipped: list[tuple[Path, str]] = []
         try:
-            if not from_video and not audios:
-                raise RuntimeError("Mode audio 'dari file' membutuhkan minimal 1 file audio.")
-            for p in videos:
+            if not videos:
+                raise RuntimeError("Pilih minimal satu video untuk live.")
+            for idx, p in enumerate(videos, start=1):
+                self.detail = f"Menganalisis video ({idx}/{len(videos)}): {p.name}"
                 i = media_info(p)
                 if not i["ok"] or not i["v"]:
                     raise RuntimeError(f"File video tidak valid / tidak terbaca: {p.name}")
-            good = []
-            for p in audios:
-                i = media_info(p)
-                if i["ok"] and i["a"]:
-                    good.append(p)
-                elif not from_video:
-                    raise RuntimeError(f"File audio tidak valid / tidak terbaca: {p.name}")
+
+            valid_audio: set[Path] = set()
+            for idx, p in enumerate(requested_audio, start=1):
+                self.detail = f"Menguji audio sampai selesai ({idx}/{len(requested_audio)}): {p.name}"
+                info = media_info(p)
+                if not info["ok"] or not info["a"]:
+                    audio_skipped.append((p, "stream audio tidak terbaca"))
+                    continue
+                valid, detail = self._validate_audio_decode(p, info["dur"])
+                if valid:
+                    valid_audio.add(p)
                 else:
-                    self._log(f"audio dilewati (tidak valid): {p.name}")
-            audios = good
-            cfg["audios"] = audios
+                    audio_skipped.append((p, detail))
+
+            loop_audio = [p for p in requested_loop if p in valid_audio]
+            random_audio = [p for p in requested_random if p in valid_audio]
+            audios = list(dict.fromkeys([*loop_audio, *random_audio]))
+            cfg["a_loop"], cfg["a_rand"], cfg["audios"] = loop_audio, random_audio, audios
+            self.files = list(dict.fromkeys(
+                [*self._playlist_files, *videos, *audios] if self.playlist_total else [*videos, *audios]
+            ))
+
+            for path, detail in audio_skipped:
+                self._log(f"audio dilewati saat pemeriksaan awal ({path.name}): {detail}")
+            if not audios:
+                if audio_skipped:
+                    errors = "; ".join(f"{p.name}: {why}" for p, why in audio_skipped[:4])
+                    raise RuntimeError(f"Tidak ada audio yang lolos pemeriksaan decode. {errors}")
+                raise RuntimeError("Pilih minimal satu file audio yang valid untuk diputar.")
+
+            self.detail = "Menyiapkan jalur stream video dan audio..."
             W, H = RES.get(int(cfg.get("height", 720)), RES[720])
             fps = int(cfg.get("fps", 30))
             vmode = cfg.get("vmode", "auto")
             # target seragam = format video pertama jika sudah layak live, selain itu pengaturan di UI
             if vmode != "normalize":
                 i0 = media_info(videos[0])
-                ok0, _ = video_copy_ok([videos[0]], [i0], relaxed=(vmode == "copy"))
-                if ok0:
+                ok0, _ = video_copy_ok([videos[0]], [i0])
+                if ok0 or vmode == "copy":
                     self._target = (i0["v"]["w"], i0["v"]["h"], int(round(i0["v"]["fps"])) or fps)
                 else:
                     self._target = (W, H, fps)
             else:
                 self._target = (W, H, fps)
             self.notes = [
-                "Video diacak tiap pergantian." if cfg.get("shuffle", True) else "Video diputar berurutan dan diulang.",
-                f"Target video seragam {self._target[0]}x{self._target[1]} {self._target[2]}fps (H.264, tanpa B-frame).",
-                ("Audio: dari video masing-masing; video tanpa audio memakai playlist audio"
-                 + (" / hening." if not audios else ".")) if from_video
-                else "Audio: playlist audio, video dibisukan.",
-                "Hanya video yang sudah siap yang disiarkan; sisanya diseragamkan di background lalu otomatis masuk putaran.",
-                "Koneksi ke YouTube dibuka setelah buffer terisi, audio tidak pernah kosong (hening disisipkan jika telat)."]
+                *(f"Audio dilewati agar tidak terputus saat live: {p.name} ({why[:120]})"
+                  for p, why in audio_skipped[:10]),
+                "Urutan video: opening opsional sekali → video acak diputar penuh dan berulang; audio berjalan independen.",
+                f"Target video seragam {self._target[0]}x{self._target[1]} {self._target[2]}fps.",
+                ("Audio RANDOM diputar penuh dan berulang dalam urutan acak tanpa pengulangan berurutan; "
+                 "audio dibatasi limiter lalu di-encode sekali menjadi AAC."
+                 if random_audio and not loop_audio else
+                 "Audio LOOP dan RANDOM opsional dicampur bersamaan, dibatasi limiter, "
+                 "lalu di-encode sekali menjadi AAC."),
+                f"Bitrate transkode: {self._spec(cfg)[3]} kbps"
+                + (" (auto)" if not int(cfg.get("vbr_k") or 0) else "")
+                + "; video yang sudah cocok dikirim copy tanpa re-encode.",
+                "File video yang belum seragam diputar via transkode langsung sambil diseragamkan di background.",
+                "Transisi antar audio tidak digunakan; setiap sumber berjalan sesuai file aslinya."]
+            if vmode != "copy":
+                for p in videos:
+                    if not self._cache_for(p, cfg).exists() and not self._copy_ok(p):
+                        self._enqueue_prep(p)
             threading.Thread(target=self._prep_worker, args=(cfg,), daemon=True).start()
-            # video yang sudah siap lebih dulu; yang perlu diseragamkan diurut dari yang terpendek (cepat tayang)
-            order = sorted(videos, key=lambda p: media_info(p)["dur"])
-            for p in order:
-                self._src(p, cfg)
-
-            self.state, self.detail = "menyiapkan", "Menyeragamkan video pertama — live dimulai setelah ada video siap..."
-            while not self.stop_event.is_set():
-                if any(self._src(p, cfg) is not None for p in videos):
-                    break
-                if all(p in self._prep_failed for p in videos):
-                    raise RuntimeError("Semua video gagal diseragamkan (lihat log / cek disk).")
-                time.sleep(1)
         except Exception as e:  # noqa: BLE001
             self.running, self.state, self.detail = False, "error", f"{e}"
             self._log(f"PERSIAPAN GAGAL: {e}")
-            self._kill(self.prep_proc)
+            self._prep_stop.set()
             return
 
         deadline = self.started_at + self.max_seconds if self.max_seconds else None
-        backoff = 3
+        backoff = 2
         while not self.stop_event.is_set():
             if deadline and time.time() >= deadline:
                 break
@@ -1751,13 +1970,18 @@ class StreamManager:
             self.restarts += 1
             ran = time.time() - t0
             wait_s = backoff
-            backoff = 3 if ran > 120 else min(backoff * 2, 60)
+            backoff = 2 if ran > 120 else min(backoff * 2, 30)
+            self._short_runs = self._short_runs + 1 if ran < 60 else 0
+            if self._short_runs >= 3:
+                self._downshift("sesi sering putus")
+                self._short_runs = 0
             self.state = "menyambung ulang"
             self.detail = f"{reason}; coba lagi {wait_s}s" + (f" ({self.detail})" if reason == "error" and self.detail else "")
             self.stop_event.wait(wait_s)
         self.running = False
         self.state = "selesai" if self.finished else "idle"
         self.detail = ""
+        self._prep_stop.set()
         self._kill(self.prep_proc)
 
     # ---------- status ----------
@@ -1774,4 +1998,7 @@ class StreamManager:
             f.seek(0, 2)
             f.seek(max(0, f.tell() - n))
             text = f.read().decode("utf-8", errors="replace")
-        return text.replace(self.stream_key, "********") if self.stream_key else text
+        for secret in set([self.stream_key, *self._secret_values]):
+            if secret:
+                text = text.replace(secret, "********")
+        return text

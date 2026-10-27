@@ -4,3 +4,10 @@ gdown
 yt-dlp[default]
 deno
 requests
+numpy
+gdown
+numpy
+pandas
+requests
+streamlit>=1.50
+yt-dlp[default]
